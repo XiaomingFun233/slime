@@ -150,10 +150,11 @@ def _hf_validate_args(args, hf_config):
             hf_ratios = _layer_ratios(layer_types)
     megatron_ratios = getattr(args, "csa_compress_ratios", None)
     if hf_ratios is not None and megatron_ratios is not None:
-        if list(hf_ratios) != list(megatron_ratios):
+        megatron_main_ratios = list(megatron_ratios)[: len(hf_ratios)]
+        if list(hf_ratios) != megatron_main_ratios:
             errors.append(
                 f"layer_types/compress_ratios in hf config {list(hf_ratios)} are not equal to "
-                f"csa_compress_ratios {list(megatron_ratios)}, please check the config."
+                f"csa_compress_ratios {list(megatron_main_ratios)}, please check the config."
             )
 
     hf_compress_rope_theta = _first_present("compress_rope_theta")
@@ -172,6 +173,8 @@ def _hf_validate_args(args, hf_config):
         rope_parameters = getattr(hf_config, "rope_parameters", None)
         if isinstance(rope_parameters, dict):
             rope_scaling = rope_parameters.get("compress", rope_parameters)
+    elif isinstance(rope_scaling, dict) and isinstance(rope_scaling.get("compress"), dict):
+        rope_scaling = rope_scaling["compress"]
     if isinstance(rope_scaling, dict) and "factor" in rope_scaling:
         megatron_scaling_factor = getattr(args, "rotary_scaling_factor", None)
         if megatron_scaling_factor is not None and not equal(rope_scaling["factor"], megatron_scaling_factor):
