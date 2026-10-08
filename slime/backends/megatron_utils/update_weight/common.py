@@ -189,7 +189,8 @@ def named_params_and_buffers(args: Namespace, model: Sequence[torch.nn.Module]) 
         # treat expert bias as normal parameters
         for name, buffer in model_module.named_buffers():
             # TODO shall we handle (almost) all buffers
-            if "expert_bias" not in name:
+            # expert_bias: learned router bias. tid2eid: DeepSeek-V4 hash-MoE table.
+            if "expert_bias" not in name and "tid2eid" not in name:
                 continue
             # for model without ddp wrap
             if not name.startswith("module.module."):

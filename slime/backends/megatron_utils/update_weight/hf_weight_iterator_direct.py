@@ -20,6 +20,7 @@ class HfWeightIteratorDirect:
     def __init__(self, args, model, model_name, quantization_config, transform_ue8m0=True):
         self.args = args
         self.model = model
+        args._slime_megatron_named_params = dict(named_params_and_buffers(args, model))
         self.model_name = model_name
         self.quantization_config = quantization_config
         self.transform_ue8m0 = transform_ue8m0

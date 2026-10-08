@@ -153,7 +153,23 @@ def _get_model_provider_func(
                     return model
                 transformer_layer_spec = result
         else:
-            if args.num_experts:
+            if getattr(config, "experimental_attention_variant", None):
+                # dsv4_hybrid (and other experimental attention variants) is rejected by
+                # get_gpt_decoder_block_spec. Megatron builds it through this spec instead.
+                try:
+                    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+                        get_transformer_block_with_experimental_attention_variant_spec,
+                    )
+                except ImportError as exc:
+                    raise ImportError(
+                        "experimental_attention_variant="
+                        f"{config.experimental_attention_variant!r} requires a Megatron that "
+                        "provides get_transformer_block_with_experimental_attention_variant_spec."
+                    ) from exc
+                transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
+                    config, vp_stage=vp_stage
+                )
+            elif args.num_experts:
                 # Define the decoder block spec
                 kwargs = {
                     "use_transformer_engine": use_te,

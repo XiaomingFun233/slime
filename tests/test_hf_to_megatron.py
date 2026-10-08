@@ -22,6 +22,7 @@ if not _has_megatron:
 from slime.backends.megatron_utils.hf_to_megatron import _LOADERS
 from slime.backends.megatron_utils.hf_to_megatron.common import SafetensorReader
 from slime.backends.megatron_utils.hf_to_megatron.deepseek import deepseek_hf_tensor
+from slime.backends.megatron_utils.hf_to_megatron.deepseek_v4 import deepseek_v4_hf_tensor
 from slime.backends.megatron_utils.hf_to_megatron.glm import glm4_hf_tensor, glm4_moe_hf_tensor
 from slime.backends.megatron_utils.hf_to_megatron.qwen import (
     mimo_hf_tensor,
@@ -32,6 +33,7 @@ from slime.backends.megatron_utils.hf_to_megatron.qwen import (
 from slime.backends.megatron_utils.hf_to_megatron.qwen3_next import qwen3_next_hf_tensor
 from slime.backends.megatron_utils.megatron_to_hf import _convert_to_hf_core
 from slime.backends.megatron_utils.megatron_to_hf.deepseekv3 import convert_deepseekv3_to_hf
+from slime.backends.megatron_utils.megatron_to_hf.deepseekv4 import convert_deepseekv4_to_hf
 from slime.backends.megatron_utils.megatron_to_hf.glm4 import convert_glm4_to_hf
 from slime.backends.megatron_utils.megatron_to_hf.glm4moe import convert_glm4moe_to_hf
 from slime.backends.megatron_utils.megatron_to_hf.mimo import convert_mimo_to_hf
@@ -320,10 +322,100 @@ def test_minimax_and_mimo_keep_their_small_qwen_deltas():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("name", "shape"),
+    [
+        ("module.module.embedding.word_embeddings.weight", (8, 4)),
+        ("module.module.decoder.hc_head_fn", (4, 16)),
+        ("module.module.decoder.layers.0.self_attention.linear_q_down_proj.weight", (4, 8)),
+        ("module.module.decoder.layers.0.self_attention.linear_o_group_proj", (8, 4)),
+        ("module.module.decoder.layers.0.self_attention.core_attention.attn_sink", (4,)),
+        ("module.module.decoder.layers.0.self_attention.core_attention.compressor.ape", (4, 8)),
+        ("module.module.decoder.layers.0.self_attention.core_attention.indexer.linear_wq_b.weight", (8, 4)),
+        ("module.module.decoder.layers.0.mlp.experts.linear_fc1.weight3", (8, 4)),
+        ("module.module.decoder.layers.0.mlp.router.tid2eid", (8, 6)),
+        ("module.module.decoder.layers.0.self_attention_hyper_connection.mapping_proj.weight", (24, 16)),
+        ("module.module.mtp.layers.0.eh_proj.weight", (8, 16)),
+    ],
+)
+def test_deepseek_v4_mapping_round_trips(name, shape):
+    parameter = torch.arange(torch.tensor(shape).prod().item()).reshape(shape)
+    args = types.SimpleNamespace(num_layers=2)
+    exported = dict(convert_deepseekv4_to_hf(args, name, parameter))
+    loaded = deepseek_v4_hf_tensor(name, Reader(**exported), _config("deepseek_v4"))
+    assert torch.equal(loaded, parameter)
+
+
+@pytest.mark.unit
+def test_deepseek_v4_exports_through_model_name():
+    parameter = torch.randn(4, 8)
+    converted = _convert_to_hf_core(
+        types.SimpleNamespace(num_layers=2, q_lora_rank=None),
+        "deepseekv4config",
+        "module.module.decoder.layers.0.self_attention.linear_proj.weight",
+        parameter,
+    )
+    assert converted == [("model.layers.0.self_attn.wo_b.weight", parameter)]
+
+
+@pytest.mark.unit
+def test_deepseek_v4_reads_official_release_names_and_c4_ape_layout():
+    config = _config("deepseek_v4")
+    config.compress_ratios = [4, 0]
+    ape = torch.tensor(
+        [[0, 1, 2, 3, 40, 41, 42, 43], [10, 11, 12, 13, 50, 51, 52, 53],
+         [20, 21, 22, 23, 60, 61, 62, 63], [30, 31, 32, 33, 70, 71, 72, 73]]
+    )
+    parts = ape.reshape(4, 2, 4)
+    official = torch.cat((parts[:2].reshape(4, 4), parts[2:].reshape(4, 4)), dim=1)
+    reader = Reader(**{"layers.0.attn.compressor.ape": official})
+    loaded = deepseek_v4_hf_tensor(
+        "module.module.decoder.layers.0.self_attention.core_attention.compressor.ape", reader, config
+    )
+    assert torch.equal(loaded, ape)
+    exported = dict(
+        convert_deepseekv4_to_hf(
+            types.SimpleNamespace(num_layers=2, csa_compress_ratios=[4, 0]),
+            "module.module.decoder.layers.0.self_attention.core_attention.compressor.ape",
+            ape,
+        )
+    )
+    assert torch.equal(exported["model.layers.0.self_attn.compressor.ape"], official)
+
+
+@pytest.mark.unit
+def test_deepseek_v4_mhc_scale_reads_siblings_without_cache():
+    parameter = torch.tensor([3.0])
+    args = types.SimpleNamespace(
+        num_layers=2,
+        _slime_megatron_named_params={
+            "module.module.decoder.layers.0.self_attention_hyper_connection.alpha_pre": torch.tensor([1.0]),
+            "module.module.decoder.layers.0.self_attention_hyper_connection.alpha_post": torch.tensor([2.0]),
+            "module.module.decoder.layers.0.self_attention_hyper_connection.alpha_res": parameter,
+        },
+    )
+    converted = convert_deepseekv4_to_hf(
+        args,
+        "module.module.decoder.layers.0.self_attention_hyper_connection.alpha_res",
+        parameter,
+    )
+    assert converted == []
+    converted = convert_deepseekv4_to_hf(
+        args,
+        "module.module.decoder.layers.0.self_attention_hyper_connection.alpha_pre",
+        args._slime_megatron_named_params[
+            "module.module.decoder.layers.0.self_attention_hyper_connection.alpha_pre"
+        ],
+    )
+    assert torch.equal(converted[0][1], torch.tensor([1.0, 2.0, 3.0]))
+
+
+@pytest.mark.unit
 def test_loader_scope_stays_explicit():
     assert set(_LOADERS) == {
         "deepseek_v3",
         "deepseek_v32",
+        "deepseek_v4",
         "glm4",
         "glm4_moe",
         "glm4_moe_lite",

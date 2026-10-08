@@ -115,6 +115,96 @@ def _hf_validate_args(args, hf_config):
 
     validate_dense_ffn = not _is_moe_config(hf_config) or _has_dense_moe_layers(args)
 
+    def _first_present(*names):
+        for name in names:
+            value = getattr(hf_config, name, None)
+            if value is not None:
+                return value
+        return None
+
+    def _layer_ratios(layer_types):
+        if layer_types is None:
+            return None
+        ratios = []
+        for layer_type in layer_types:
+            label = str(layer_type).lower()
+            if label in {"w", "window", "sliding_window", "sliding_attention", "full_attention"}:
+                ratios.append(0)
+            elif "128" in label or "hca" in label or "heavily_compressed" in label:
+                ratios.append(128)
+            elif label == "c4" or "compressed_sparse" in label or "csa" in label:
+                ratios.append(4)
+            else:
+                return None
+        return ratios
+
+    hf_ratios = _first_present("compress_ratios", "csa_compress_ratios")
+    if hf_ratios is None:
+        layer_types = _first_present("layer_types")
+        compress_rates = _first_present("compress_rates")
+        if isinstance(compress_rates, dict) and layer_types is not None:
+            hf_ratios = [compress_rates.get(layer_type) for layer_type in layer_types]
+            if any(ratio is None for ratio in hf_ratios):
+                hf_ratios = None
+        if hf_ratios is None:
+            hf_ratios = _layer_ratios(layer_types)
+    megatron_ratios = getattr(args, "csa_compress_ratios", None)
+    if hf_ratios is not None and megatron_ratios is not None:
+        if list(hf_ratios) != list(megatron_ratios):
+            errors.append(
+                f"layer_types/compress_ratios in hf config {list(hf_ratios)} are not equal to "
+                f"csa_compress_ratios {list(megatron_ratios)}, please check the config."
+            )
+
+    hf_compress_rope_theta = _first_present("compress_rope_theta")
+    if hf_compress_rope_theta is not None:
+        megatron_compress_rope_theta = getattr(args, "csa_compress_rotary_base", None)
+        if megatron_compress_rope_theta is not None and not equal(
+            hf_compress_rope_theta, megatron_compress_rope_theta
+        ):
+            errors.append(
+                f"compress_rope_theta in hf config {hf_compress_rope_theta} is not equal to "
+                f"csa_compress_rotary_base {megatron_compress_rope_theta}, please check the config."
+            )
+
+    rope_scaling = getattr(hf_config, "rope_scaling", None)
+    if rope_scaling is None:
+        rope_parameters = getattr(hf_config, "rope_parameters", None)
+        if isinstance(rope_parameters, dict):
+            rope_scaling = rope_parameters.get("compress", rope_parameters)
+    if isinstance(rope_scaling, dict) and "factor" in rope_scaling:
+        megatron_scaling_factor = getattr(args, "rotary_scaling_factor", None)
+        if megatron_scaling_factor is not None and not equal(rope_scaling["factor"], megatron_scaling_factor):
+            errors.append(
+                f"rope_scaling.factor in hf config {rope_scaling['factor']} is not equal to "
+                f"rotary_scaling_factor {megatron_scaling_factor}, please check the config."
+            )
+
+    hf_hash_layers = _first_present("num_hash_layers", "n_hash_layers")
+    megatron_hash_layers = getattr(args, "moe_n_hash_layers", None)
+    if hf_hash_layers is not None and megatron_hash_layers is not None and not equal(
+        hf_hash_layers, megatron_hash_layers
+    ):
+        errors.append(
+            f"num_hash_layers in hf config {hf_hash_layers} is not equal to "
+            f"moe_n_hash_layers {megatron_hash_layers}, please check the config."
+        )
+
+    hf_mlp_types = _first_present("mlp_layer_types")
+    if hf_mlp_types is not None and megatron_hash_layers is not None:
+        hash_labels = {"h", "hash", "hash_moe", "hashmoe"}
+        normalized_mlp_types = [
+            "hash" if str(value).lower() in hash_labels else str(value).lower() for value in hf_mlp_types
+        ]
+        expected_mlp_types = ["hash"] * int(megatron_hash_layers) + [
+            "moe"
+        ] * max(0, len(hf_mlp_types) - int(megatron_hash_layers))
+        if normalized_mlp_types != expected_mlp_types:
+            errors.append(
+                f"mlp_layer_types in hf config {list(hf_mlp_types)} do not match the expected "
+                f"hash/moe schedule for moe_n_hash_layers {megatron_hash_layers}, please check the config."
+            )
+
     for hf_config_name, megatron_config_name, compare_fn in [
         ("hidden_size", "hidden_size", equal),
         ("num_attention_heads", "num_attention_heads", equal),
