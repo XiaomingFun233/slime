@@ -411,6 +411,30 @@ def test_deepseek_v4_mhc_scale_reads_siblings_without_cache():
 
 
 @pytest.mark.unit
+def test_reader_dequantizes_official_v4_fp8_and_fp4_scales(tmp_path):
+    fp8_weight = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], dtype=torch.float8_e4m3fn)
+    fp4_codes = torch.tensor([[0x10, 0x32]], dtype=torch.int8)
+    save_file(
+        {
+            "fp8.weight": fp8_weight,
+            "fp8.scale": torch.tensor([[2.0, 4.0]], dtype=torch.float8_e8m0fnu),
+            "fp4.weight": fp4_codes,
+            "fp4.scale": torch.tensor([[2.0]], dtype=torch.float8_e8m0fnu),
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    reader = SafetensorReader(tmp_path)
+    assert torch.equal(
+        reader.get_tensor("fp8.weight"),
+        torch.tensor([[2.0, 4.0, 12.0, 16.0], [10.0, 12.0, 28.0, 32.0]], dtype=torch.bfloat16),
+    )
+    assert torch.equal(
+        reader.get_tensor("fp4.weight"),
+        torch.tensor([[0.0, 1.0, 2.0, 3.0]], dtype=torch.bfloat16),
+    )
+
+
+@pytest.mark.unit
 def test_loader_scope_stays_explicit():
     assert set(_LOADERS) == {
         "deepseek_v3",

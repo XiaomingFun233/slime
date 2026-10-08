@@ -40,6 +40,34 @@ class SafetensorReader:
             self._files[filename] = safe_open(self.path / filename, framework="pt", device="cpu")
         tensor = self._files[filename].get_tensor(name)
         scale_name = f"{name}_scale_inv"
+        official_scale_name = name.removesuffix(".weight") + ".scale"
+        if tensor.element_size() == 1 and official_scale_name in self:
+            scale_file = self.weight_map[official_scale_name]
+            if scale_file not in self._files:
+                self._files[scale_file] = safe_open(self.path / scale_file, framework="pt", device="cpu")
+            scale = self._files[scale_file].get_tensor(official_scale_name).to(torch.float32)
+            if tensor.dtype == torch.int8:
+                # Official V4 expert weights store two E2M1 FP4 values per byte.
+                codes = tensor.to(torch.uint8)
+                low = codes & 0x0F
+                high = (codes >> 4) & 0x0F
+                lut = tensor.new_tensor(
+                    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+                    dtype=torch.float32,
+                )
+                tensor = lut[torch.stack((low, high), dim=-1).reshape(*tensor.shape[:-1], -1).long()]
+            else:
+                tensor = tensor.to(torch.float32)
+            rows, columns = tensor.shape
+            scale_rows, scale_columns = scale.shape
+            if rows % scale_rows or columns % scale_columns:
+                raise ValueError(
+                    f"Official scale shape {tuple(scale.shape)} does not tile weight {tuple(tensor.shape)} for {name}"
+                )
+            tensor = tensor.view(scale_rows, rows // scale_rows, scale_columns, columns // scale_columns)
+            tensor = (tensor * scale[:, None, :, None]).reshape(rows, columns)
+            return tensor.to(torch.bfloat16)
         if tensor.element_size() == 1 and scale_name in self:
             scale_file = self.weight_map[scale_name]
             if scale_file not in self._files:
