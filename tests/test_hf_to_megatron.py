@@ -327,6 +327,11 @@ def test_minimax_and_mimo_keep_their_small_qwen_deltas():
     [
         ("module.module.embedding.word_embeddings.weight", (8, 4)),
         ("module.module.decoder.hc_head_fn", (4, 16)),
+        ("module.module.decoder.layers.2.hc_head_fn", (4, 16)),
+        ("module.module.mtp.layers.0.hc_head_fn", (4, 16)),
+        ("module.module.mtp.layers.0.e_proj.weight", (4, 8)),
+        ("module.module.mtp.layers.0.h_proj.weight", (4, 8)),
+        ("module.module.mtp.layers.0.mtp_model_layer.self_attention.linear_q_down_proj.weight", (4, 8)),
         ("module.module.decoder.layers.0.self_attention.linear_q_down_proj.weight", (4, 8)),
         ("module.module.decoder.layers.0.self_attention.linear_o_group_proj", (8, 4)),
         ("module.module.decoder.layers.0.self_attention.core_attention.attn_sink", (4,)),
@@ -384,6 +389,37 @@ def test_deepseek_v4_reads_official_release_names_and_c4_ape_layout():
 
 
 @pytest.mark.unit
+def test_deepseek_v4_reads_official_mtp_names():
+    config = _config("deepseek_v4")
+    parameter = torch.arange(16).reshape(4, 4)
+    reader = Reader(
+        **{
+            "mtp.0.hc_head_fn": parameter,
+            "mtp.0.e_proj.weight": parameter,
+            "mtp.0.norm.weight": parameter,
+            "mtp.0.attn.wq_a.weight": parameter,
+        }
+    )
+    for name in (
+        "module.module.decoder.layers.2.hc_head_fn",
+        "module.module.mtp.layers.0.hc_head_fn",
+    ):
+        assert torch.equal(deepseek_v4_hf_tensor(name, reader, config), parameter)
+    assert torch.equal(
+        deepseek_v4_hf_tensor("module.module.mtp.layers.0.e_proj.weight", reader, config), parameter
+    )
+    assert torch.equal(
+        deepseek_v4_hf_tensor("module.module.mtp.layers.0.final_layernorm.weight", reader, config), parameter
+    )
+    assert torch.equal(
+        deepseek_v4_hf_tensor(
+            "module.module.mtp.layers.0.mtp_model_layer.self_attention.linear_q_down_proj.weight", reader, config
+        ),
+        parameter,
+    )
+
+
+@pytest.mark.unit
 def test_deepseek_v4_mhc_scale_reads_siblings_without_cache():
     parameter = torch.tensor([3.0])
     args = types.SimpleNamespace(
@@ -396,18 +432,52 @@ def test_deepseek_v4_mhc_scale_reads_siblings_without_cache():
     )
     converted = convert_deepseekv4_to_hf(
         args,
-        "module.module.decoder.layers.0.self_attention_hyper_connection.alpha_res",
-        parameter,
-    )
-    assert converted == []
-    converted = convert_deepseekv4_to_hf(
-        args,
         "module.module.decoder.layers.0.self_attention_hyper_connection.alpha_pre",
         args._slime_megatron_named_params[
             "module.module.decoder.layers.0.self_attention_hyper_connection.alpha_pre"
         ],
     )
+    assert converted == []
+    converted = convert_deepseekv4_to_hf(
+        args,
+        "module.module.decoder.layers.0.self_attention_hyper_connection.alpha_res",
+        parameter,
+    )
     assert torch.equal(converted[0][1], torch.tensor([1.0, 2.0, 3.0]))
+
+
+@pytest.mark.unit
+def test_deepseek_v4_wq_a_and_wkv_use_matching_fp8_dtype(monkeypatch):
+    kernel_module = types.ModuleType("slime.backends.megatron_utils.kernels.fp8_kernel")
+    kernel_module.blockwise_cast_to_fp8_triton = None
+    sglang_module = types.ModuleType("slime.backends.megatron_utils.sglang")
+    sglang_module.quant_weight_ue8m0 = None
+    sglang_module.should_deepgemm_weight_requant_ue8m0 = None
+    sglang_module.transform_scale_ue8m0 = None
+    monkeypatch.setitem(sys.modules, kernel_module.__name__, kernel_module)
+    monkeypatch.setitem(sys.modules, sglang_module.__name__, sglang_module)
+
+    module_name = "slime.backends.megatron_utils.megatron_to_hf.processors._quantizer_fp8_test"
+    module_path = Path(__file__).resolve().parents[1] / "slime/backends/megatron_utils/megatron_to_hf/processors/quantizer_fp8.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    config = {"quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic", "weight_block_size": None}
+    weight = torch.ones(2, 2, dtype=torch.bfloat16)
+    for megatron_name, hf_name in (
+        ("self_attention.linear_q_down_proj.weight", "self_attn.wq_a.weight"),
+        ("self_attention.linear_kv_proj.weight", "self_attn.wkv.weight"),
+    ):
+        converted = module.quantize_params_fp8(
+            types.SimpleNamespace(),
+            f"module.module.decoder.layers.0.{megatron_name}",
+            [(f"model.layers.0.{hf_name}", weight)],
+            config,
+        )
+        assert converted[0][1].dtype == torch.float8_e4m3fn
+        assert converted[1][0] == f"model.layers.0.{hf_name.removesuffix('.weight')}.weight_scale"
 
 
 @pytest.mark.unit

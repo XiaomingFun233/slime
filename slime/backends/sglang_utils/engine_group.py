@@ -9,6 +9,7 @@ import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
+from slime.backends.sglang_utils.fp4_compat import needs_dsv4_fp4_dequant
 from slime.backends.sglang_utils.sglang_config import ServerGroupConfig
 from slime.backends.sglang_utils.sglang_engine import SGLangEngine
 from slime.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, add_default_ray_env_vars
@@ -101,6 +102,19 @@ class ServerGroup:
             )
 
         RolloutRayActor = ray.remote(SGLangEngine)
+        dequant_fp4_experts = needs_dsv4_fp4_dequant(self.model_path, self.args.hf_checkpoint)
+        if dequant_fp4_experts:
+            from sglang.srt.environ import envs
+
+            if not hasattr(envs, "SGLANG_DSV4_FP4_DEQUANT"):
+                raise RuntimeError(
+                    "Online updates for DeepSeek-V4 FP4 experts require SGLang's "
+                    "SGLANG_DSV4_FP4_DEQUANT capability"
+                )
+            logger.warning(
+                "DeepSeek-V4 FP4 checkpoint uses SGLang's FP4-to-FP8 expert path "
+                "for online weight updates; rollout weights require extra GPU memory"
+            )
 
         rollout_engines = []
         for i in range(len(self.all_engines)):
@@ -134,6 +148,8 @@ class ServerGroup:
                     "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
                 }.items()
             }
+            if dequant_fp4_experts:
+                env_vars["SGLANG_DSV4_FP4_DEQUANT"] = os.environ.get("SGLANG_DSV4_FP4_DEQUANT", "1")
             rollout_engine = RolloutRayActor.options(
                 num_cpus=num_cpus,
                 num_gpus=num_gpus,

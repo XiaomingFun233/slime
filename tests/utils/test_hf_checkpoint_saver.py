@@ -30,6 +30,7 @@ def test_copy_hf_assets_keeps_quantized_config_and_skips_weights(tmp_path: Path)
     (src / "model.safetensors.index.json").write_text("{}", encoding="utf-8")
     (src / "model-00001-of-00001.safetensors").write_bytes(b"weight")
     (src / "pytorch_model.bin").write_bytes(b"weight")
+    (src / ".msc").write_bytes(b"storage metadata")
 
     _copy_hf_assets(str(src), dst)
 
@@ -38,6 +39,7 @@ def test_copy_hf_assets_keeps_quantized_config_and_skips_weights(tmp_path: Path)
     assert not (dst / "model.safetensors.index.json").exists()
     assert not (dst / "model-00001-of-00001.safetensors").exists()
     assert not (dst / "pytorch_model.bin").exists()
+    assert not (dst / ".msc").exists()
 
 
 def test_clear_existing_hf_weights_removes_old_weight_files_only(tmp_path: Path):

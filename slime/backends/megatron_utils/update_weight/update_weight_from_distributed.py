@@ -19,6 +19,7 @@ from slime.utils.http_utils import _wrap_ipv6
 
 from ..megatron_to_hf import convert_to_hf
 from .common import all_gather_param, named_params_and_buffers
+from .hf_weight_iterator_direct import group_v4_fusion_pairs
 
 
 class UpdateWeightFromDistributed:
@@ -109,13 +110,17 @@ class UpdateWeightFromDistributed:
         if dist.get_rank() == 0:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            session_opened = ray.get([engine.begin_weight_update.remote() for engine in self.rollout_engines])
+            legacy_engines = [
+                engine for engine, opened in zip(self.rollout_engines, session_opened, strict=True) if not opened
+            ]
 
             # int4/fp4 pre_process
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            if legacy_engines and self.quantization_config and self.quantization_config["quant_method"] == "compressed-tensors":
                 post_process_weights(
                     restore_weights_before_load=True,
                     post_process_quantization=False,
-                    rollout_engines=self.rollout_engines,
+                    rollout_engines=legacy_engines,
                 )
         dist.barrier(group=get_gloo_group())
 
@@ -124,12 +129,13 @@ class UpdateWeightFromDistributed:
 
         if dist.get_rank() == 0:
             # int4/fp4 post_process
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            if legacy_engines and self.quantization_config and self.quantization_config["quant_method"] == "compressed-tensors":
                 post_process_weights(
                     restore_weights_before_load=False,
                     post_process_quantization=True,
-                    rollout_engines=self.rollout_engines,
+                    rollout_engines=legacy_engines,
                 )
+            ray.get([engine.end_weight_update.remote() for engine in self.rollout_engines])
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
@@ -158,13 +164,19 @@ class UpdateWeightFromDistributed:
         """
         buffer_size = 0
         buffer: list[tuple[str, torch.Tensor]] = []
-        for name, param in named_params_and_buffers(self.args, self.model):
-            if ".experts." in name:
-                continue
-            param = all_gather_param(name, param)
+        named_params = [(name, param) for name, param in named_params_and_buffers(self.args, self.model) if ".experts." not in name]
+        if "deepseekv4" in self.model_name.lower():
+            groups = group_v4_fusion_pairs(named_params, lambda item: item[0])
+        else:
+            groups = ([item] for item in named_params)
+        for group in groups:
+            hf_chunk = []
+            for name, param in group:
+                param = all_gather_param(name, param)
+                if self._is_pp_src_rank:
+                    hf_chunk.extend(convert_to_hf(self.args, self.model_name, name, param, self.quantization_config))
             if not self._is_pp_src_rank:
                 continue
-            hf_chunk = convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
             chunk_bytes = sum(t.numel() * t.element_size() for _, t in hf_chunk)
             if buffer and buffer_size + chunk_bytes > self.args.update_weight_buffer_size:
                 yield buffer

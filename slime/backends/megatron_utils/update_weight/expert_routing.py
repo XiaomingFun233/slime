@@ -358,7 +358,11 @@ def configure_expert_routing(
         buffer_size = args.update_weight_buffer_size
         expert_transfer_plan = _build_expert_transfer_plan(expert_params, buffer_size)
         expert_transfer_batches = sum(len(group) for group in expert_transfer_plan)
-        dense_buckets = pack_param_info_buckets(dense_infos, buffer_size)
+        dense_buckets = pack_param_info_buckets(
+            dense_infos,
+            buffer_size,
+            keep_v4_fusion_pairs=getattr(args, "experimental_attention_variant", None) == "dsv4_hybrid",
+        )
     except (AttributeError, TypeError, ValueError) as exc:
         _log_disabled_expert_routing(str(exc))
         return None, []

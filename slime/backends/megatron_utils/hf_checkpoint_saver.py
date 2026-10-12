@@ -322,7 +322,7 @@ def _copy_hf_assets(origin_hf_dir: str, output_dir: Path) -> None:
         raise ValueError(f"--hf-checkpoint must be a local directory when using raw --save-hf: {origin_hf_dir}")
 
     for item in origin.iterdir():
-        if item.is_file():
+        if item.is_file() and not item.name.startswith("."):
             if _is_hf_weight_file(item):
                 continue
             shutil.copy2(item, output_dir / item.name)

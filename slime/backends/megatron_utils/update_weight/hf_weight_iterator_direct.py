@@ -24,7 +24,9 @@ class HfWeightIteratorDirect:
         self.model_name = model_name
         self.quantization_config = quantization_config
         self.transform_ue8m0 = transform_ue8m0
-        self.megatron_local_param_info_buckets = _get_megatron_local_param_info_buckets(self.args, self.model)
+        self.megatron_local_param_info_buckets = _get_megatron_local_param_info_buckets(
+            self.args, self.model, keep_v4_fusion_pairs="deepseekv4" in model_name.lower()
+        )
 
     def get_hf_weight_chunks(
         self,
@@ -37,11 +39,20 @@ class HfWeightIteratorDirect:
         param_info_buckets = (
             self.megatron_local_param_info_buckets if param_info_buckets is None else param_info_buckets
         )
+        is_deepseek_v4 = "deepseekv4" in self.model_name.lower()
+        if is_deepseek_v4:
+            self.args._slime_megatron_named_params = {}
 
         for chunk_idx, megatron_local_param_infos in enumerate(
             tqdm(param_info_buckets, disable=rank != 0, desc=progress_desc)
         ):
             megatron_full_params = _get_megatron_full_params(megatron_local_param_infos, megatron_local_weights)
+            if is_deepseek_v4:
+                self.args._slime_megatron_named_params.update(
+                    (info.name, param)
+                    for info, param in zip(megatron_local_param_infos, megatron_full_params, strict=True)
+                    if "_hyper_connection.alpha_" in info.name
+                )
             if should_convert_chunk is None or should_convert_chunk(chunk_idx):
                 hf_named_tensors = self._convert_to_hf_named_tensors(megatron_full_params, megatron_local_param_infos)
             else:
@@ -135,30 +146,70 @@ def _get_megatron_full_params(
     return gathered_params
 
 
-def _get_megatron_local_param_info_buckets(args: Namespace, model: Sequence[torch.nn.Module]) -> list[list[ParamInfo]]:
+def _get_megatron_local_param_info_buckets(
+    args: Namespace, model: Sequence[torch.nn.Module], keep_v4_fusion_pairs: bool = False
+) -> list[list[ParamInfo]]:
     """
     Partition params into buckets ≤ update_weight_buffer_size (with TP replication).
     """
     param_infos = _get_megatron_local_param_infos(args, model)
-    return pack_param_info_buckets(param_infos, args.update_weight_buffer_size)
+    return pack_param_info_buckets(
+        param_infos, args.update_weight_buffer_size, keep_v4_fusion_pairs=keep_v4_fusion_pairs
+    )
+
+
+def _v4_fusion_pair_key(name: str) -> str | None:
+    for suffix, pair in (
+        (".self_attention.linear_q_down_proj.weight", "wqkv_a"),
+        (".self_attention.linear_kv_proj.weight", "wqkv_a"),
+        (".compressor.linear_wkv.weight", "compressor_wkv_gate"),
+        (".compressor.linear_wgate.weight", "compressor_wkv_gate"),
+    ):
+        if name.endswith(suffix):
+            return name[: -len(suffix)] + "." + pair
+    return None
+
+
+def group_v4_fusion_pairs(items, get_name):
+    paired_items = {}
+    for item in items:
+        key = _v4_fusion_pair_key(get_name(item))
+        if key is not None:
+            paired_items.setdefault(key, []).append(item)
+    seen_pairs = set()
+    for item in items:
+        key = _v4_fusion_pair_key(get_name(item))
+        if key is None:
+            yield [item]
+        elif key not in seen_pairs:
+            yield paired_items[key]
+            seen_pairs.add(key)
 
 
 def pack_param_info_buckets(
     param_infos: Sequence[ParamInfo],
     update_weight_buffer_size: int,
+    keep_v4_fusion_pairs: bool = False,
 ) -> list[list[ParamInfo]]:
     param_info_buckets = [[]]  # Start with one empty bucket
     buffer_size = 0  # Track current bucket size in bytes
 
-    for info in param_infos:
-        # Expert params use expert-TP size, others use regular-TP size
-        if ".experts." in info.name:
-            tp_size = mpu.get_expert_tensor_parallel_world_size()
-        else:
-            tp_size = mpu.get_tensor_model_parallel_world_size()
+    if keep_v4_fusion_pairs:
+        groups = group_v4_fusion_pairs(param_infos, lambda info: info.name)
+    else:
+        groups = ([info] for info in param_infos)
 
-        # Full param size = shard size × TP replicas (all-gather will reconstruct full param)
-        param_size = info.size * tp_size
+    for group in groups:
+        # Expert params use expert-TP size, others use regular-TP size
+        param_size = sum(
+            info.size
+            * (
+                mpu.get_expert_tensor_parallel_world_size()
+                if ".experts." in info.name
+                else mpu.get_tensor_model_parallel_world_size()
+            )
+            for info in group
+        )
 
         # If adding this param exceeds limit AND current bucket has params: start new bucket
         if buffer_size + param_size > update_weight_buffer_size and len(param_info_buckets[-1]) > 0:
@@ -166,7 +217,7 @@ def pack_param_info_buckets(
             buffer_size = 0
 
         # Add param to current bucket and update size
-        param_info_buckets[-1].append(info)
+        param_info_buckets[-1].extend(group)
         buffer_size += param_size
 
     return param_info_buckets

@@ -48,8 +48,7 @@ class _DeepSeekV4Reader:
         self.reader = reader
         self.config = config
 
-    @staticmethod
-    def _official_name(name: str) -> str:
+    def _official_name(self, name: str) -> str:
         if name == "model.embed_tokens.weight":
             return "embed.weight"
         if name == "lm_head.weight":
@@ -58,7 +57,13 @@ class _DeepSeekV4Reader:
             return "norm.weight"
         if name.startswith("model.hc_head_"):
             return name.removeprefix("model.")
-        name = name.replace("model.layers.", "layers.")
+        layer_match = re.match(r"model\.layers\.(\d+)\.(.+)", name)
+        if layer_match and int(layer_match.group(1)) >= self.config.num_hidden_layers:
+            mtp_layer = int(layer_match.group(1)) - self.config.num_hidden_layers
+            name = f"mtp.{mtp_layer}.{layer_match.group(2)}"
+            name = name.replace(".shared_head.norm.weight", ".norm.weight")
+        else:
+            name = name.replace("model.layers.", "layers.")
         name = name.replace(".self_attn.", ".attn.")
         name = name.replace(".mlp.", ".ffn.")
         name = name.replace(".input_layernorm.", ".attn_norm.")
@@ -104,8 +109,14 @@ def _hc_alphas(scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.T
 
 
 def _layer_tensor(layer: int, rest: str, reader: SafetensorReader) -> torch.Tensor:
+    rest = rest.removeprefix("mtp_model_layer.")
     prefix = f"model.layers.{layer}"
     direct = {
+        "hc_head_fn": "hc_head_fn",
+        "hc_head_base": "hc_head_base",
+        "hc_head_scale": "hc_head_scale",
+        "e_proj.weight": "e_proj.weight",
+        "h_proj.weight": "h_proj.weight",
         "input_layernorm.weight": "input_layernorm.weight",
         "pre_mlp_layernorm.weight": "post_attention_layernorm.weight",
         "mlp.linear_fc1.layer_norm_weight": "post_attention_layernorm.weight",
@@ -199,13 +210,18 @@ def deepseek_v4_hf_tensor(name: str, reader: SafetensorReader, config) -> torch.
         layer = config.num_hidden_layers + int(mtp_layer)
         direct = {
             "eh_proj.weight": "eh_proj.weight",
+            "e_proj.weight": "e_proj.weight",
+            "h_proj.weight": "h_proj.weight",
             "enorm.weight": "enorm.weight",
             "hnorm.weight": "hnorm.weight",
             "final_layernorm.weight": "shared_head.norm.weight",
+            "hc_head_fn": "hc_head_fn",
+            "hc_head_base": "hc_head_base",
+            "hc_head_scale": "hc_head_scale",
         }
         if rest in direct:
             return reader.get_tensor(f"model.layers.{layer}.{direct[rest]}")
-        rest = rest.removeprefix("transformer_layer.")
+        rest = rest.removeprefix("transformer_layer.").removeprefix("mtp_model_layer.")
         return _layer_tensor(layer, rest, reader)
 
     match = re.fullmatch(r"decoder\.layers\.(\d+)\.(.+)", name)

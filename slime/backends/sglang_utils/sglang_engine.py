@@ -242,6 +242,30 @@ class SGLangEngine(RayActor):
         response.raise_for_status()
         return True
 
+    def begin_weight_update(self) -> bool:
+        if self.node_rank != 0:
+            return False
+        if getattr(self, "_weight_update_session_open", False):
+            raise RuntimeError("A weight-update session is already open")
+        try:
+            result = self._make_request("begin_weight_update", {"selector": "all"})
+        except requests.exceptions.HTTPError as error:
+            if error.response is not None and error.response.status_code == 404:
+                return False
+            raise
+        if result.get("success") is not True:
+            raise RuntimeError(f"Failed to begin SGLang weight-update session: {result}")
+        self._weight_update_session_open = True
+        return True
+
+    def end_weight_update(self) -> None:
+        if self.node_rank != 0 or not getattr(self, "_weight_update_session_open", False):
+            return
+        result = self._make_request("end_weight_update")
+        if result.get("success") is not True:
+            raise RuntimeError(f"Failed to end SGLang weight-update session: {result}")
+        self._weight_update_session_open = False
+
     def update_weights_from_tensor(
         self,
         serialized_named_tensors: list[str],

@@ -284,11 +284,15 @@ class UpdateWeightFromTensor:
         if self.rank == 0:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            session_opened = ray.get([engine.begin_weight_update.remote() for engine in self.rollout_engines])
+            legacy_engines = [
+                engine for engine, opened in zip(self.rollout_engines, session_opened, strict=True) if not opened
+            ]
+            if legacy_engines and self.quantization_config and self.quantization_config["quant_method"] == "compressed-tensors":
                 post_process_weights(
                     restore_weights_before_load=True,
                     post_process_quantization=False,
-                    rollout_engines=self.rollout_engines,
+                    rollout_engines=legacy_engines,
                 )
         dist.barrier(group=get_gloo_group())
 
@@ -303,6 +307,7 @@ class UpdateWeightFromTensor:
         ):
             refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
             ray.get(refs)
+            dist.barrier(group=get_gloo_group())
             # Free GPU tensors so the caching allocator can reuse the blocks,
             # then release CUDA IPC cache entries whose consumers (sglang engines)
             # have already closed their IPC handles.
@@ -322,12 +327,13 @@ class UpdateWeightFromTensor:
 
         # int4/fp4 post_process
         if self.rank == 0:
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            if legacy_engines and self.quantization_config and self.quantization_config["quant_method"] == "compressed-tensors":
                 post_process_weights(
                     restore_weights_before_load=False,
                     post_process_quantization=True,
-                    rollout_engines=self.rollout_engines,
+                    rollout_engines=legacy_engines,
                 )
+            ray.get([engine.end_weight_update.remote() for engine in self.rollout_engines])
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 

@@ -54,6 +54,69 @@ class _FakeEngine:
         self.update_weights_from_tensor = _FakeRemoteMethod()
 
 
+@pytest.mark.parametrize("supports_session", [True, False])
+def test_colocated_weight_update_session_spans_all_chunks(monkeypatch, supports_session):
+    module, _ = _load_update_weight_module(monkeypatch)
+    events = []
+
+    def remote_method(name, result=None):
+        def remote(**kwargs):
+            events.append(name)
+            return result
+
+        return types.SimpleNamespace(remote=remote)
+
+    engine = types.SimpleNamespace(
+        pause_generation=remote_method("pause"),
+        flush_cache=remote_method("flush"),
+        begin_weight_update=remote_method("begin", supports_session),
+        end_weight_update=remote_method("end"),
+        continue_generation=remote_method("continue"),
+    )
+    module.ray.get = lambda refs: refs
+    module.dist.barrier = lambda group=None: events.append("barrier")
+    module.accelerator.empty_cache = lambda: None
+    module.post_process_weights = lambda **kwargs: events.append(
+        "legacy_pre" if kwargs["restore_weights_before_load"] else "legacy_post"
+    )
+
+    updater = module.UpdateWeightFromTensor.__new__(module.UpdateWeightFromTensor)
+    updater.rank = 0
+    updater.weight_version = 0
+    updater.rollout_engines = [engine]
+    updater.quantization_config = {"quant_method": "compressed-tensors"}
+    updater.weights_getter = lambda: {}
+    updater._non_expert_param_info_buckets = None
+    updater._full_param_info_buckets = ()
+    updater._expert_transfer_plan = []
+    updater._hf_weight_iterator = types.SimpleNamespace(get_hf_weight_chunks=lambda *args, **kwargs: [[], []])
+    updater._send_hf_params = lambda params: (events.append("chunk") or [], [])
+
+    updater.update_weights()
+
+    if supports_session:
+        assert events == [
+            "pause", "flush", "begin", "barrier", "chunk", "barrier", "chunk", "barrier", "barrier", "end", "continue", "barrier"
+        ]
+    else:
+        assert events == [
+            "pause",
+            "flush",
+            "begin",
+            "legacy_pre",
+            "barrier",
+            "chunk",
+            "barrier",
+            "chunk",
+            "barrier",
+            "barrier",
+            "legacy_post",
+            "end",
+            "continue",
+            "barrier",
+        ]
+
+
 def _install_fake_deps(monkeypatch):
     dist_state = types.SimpleNamespace(rank=0, world_size=2, gathered=None, local_object=None)
 
@@ -178,6 +241,129 @@ def _load_update_weight_module(monkeypatch):
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module, dist_state
+
+
+def test_v4_fused_weights_stay_in_one_update_bucket(monkeypatch):
+    _load_update_weight_module(monkeypatch)
+    mpu = sys.modules["megatron.core.mpu"]
+    mpu.get_tensor_model_parallel_world_size = lambda: 1
+    mpu.get_expert_tensor_parallel_world_size = lambda: 1
+    sys.modules["slime.backends.megatron_utils.sglang"].monkey_patch_torch_reductions = lambda: None
+
+    common = types.ModuleType("slime.backends.megatron_utils.update_weight.common")
+    common.all_gather_params_async = lambda params: params
+    common.named_params_and_buffers = lambda args, model: []
+    monkeypatch.setitem(sys.modules, common.__name__, common)
+
+    module_name = "slime.backends.megatron_utils.update_weight.hf_weight_iterator_direct"
+    module_path = REPO_ROOT / "slime/backends/megatron_utils/update_weight/hf_weight_iterator_direct.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, module)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    names = [
+        "module.module.decoder.layers.0.self_attention.linear_kv_proj.weight",
+        "module.module.decoder.layers.0.self_attention.linear_q_down_proj.weight",
+        "module.module.decoder.layers.0.self_attention.q_layernorm.weight",
+        "module.module.decoder.layers.0.self_attention.core_attention.compressor.linear_wgate.weight",
+        "module.module.decoder.layers.0.self_attention.core_attention.compressor.linear_wkv.weight",
+    ]
+    infos = [types.SimpleNamespace(name=name, size=6) for name in names]
+    buckets = module.pack_param_info_buckets(infos, 10, keep_v4_fusion_pairs=True)
+    bucket_names = [[info.name for info in bucket] for bucket in buckets]
+
+    assert set(names[:2]) == set(bucket_names[0])
+    assert set(names[3:]) == set(bucket_names[2])
+    assert bucket_names[1] == [names[2]]
+
+    common.all_gather_param = lambda name, param: param
+    common.named_params_and_buffers = lambda args, model: [(name, types.SimpleNamespace()) for name in names]
+    sys.modules["slime.utils.distributed_utils"].init_process_group = lambda *args, **kwargs: None
+    sys.modules["slime.backends.megatron_utils.megatron_to_hf"].convert_to_hf = lambda args, model, name, param, quant: [
+        (name, types.SimpleNamespace(numel=lambda: 6, element_size=lambda: 1))
+    ]
+
+    distributed_name = "slime.backends.megatron_utils.update_weight.update_weight_from_distributed"
+    distributed_path = REPO_ROOT / "slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py"
+    distributed_spec = importlib.util.spec_from_file_location(distributed_name, distributed_path)
+    distributed_module = importlib.util.module_from_spec(distributed_spec)
+    monkeypatch.setitem(sys.modules, distributed_name, distributed_module)
+    assert distributed_spec.loader is not None
+    distributed_spec.loader.exec_module(distributed_module)
+
+    updater = distributed_module.UpdateWeightFromDistributed.__new__(distributed_module.UpdateWeightFromDistributed)
+    updater.args = types.SimpleNamespace(update_weight_buffer_size=10)
+    updater.model = []
+    updater.model_name = "DeepseekV4ForCausalLM"
+    updater.quantization_config = None
+    updater._is_pp_src_rank = True
+    distributed_chunks = list(updater._iter_non_expert_chunks())
+    assert [set(name for name, _ in chunk) for chunk in distributed_chunks] == [
+        set(names[:2]),
+        {names[2]},
+        set(names[3:]),
+    ]
+
+
+@pytest.mark.parametrize("supports_session", [True, False])
+def test_distributed_weight_update_session_spans_all_chunks(monkeypatch, supports_session):
+    _load_update_weight_module(monkeypatch)
+    sys.modules["slime.utils.distributed_utils"].init_process_group = lambda *args, **kwargs: None
+    sys.modules["slime.backends.megatron_utils.update_weight.hf_weight_iterator_direct"].group_v4_fusion_pairs = (
+        lambda items, get_name: ([item] for item in items)
+    )
+    common = types.ModuleType("slime.backends.megatron_utils.update_weight.common")
+    common.all_gather_param = lambda name, param: param
+    common.named_params_and_buffers = lambda args, model: []
+    monkeypatch.setitem(sys.modules, common.__name__, common)
+
+    module_name = "slime.backends.megatron_utils.update_weight.update_weight_from_distributed"
+    module_path = REPO_ROOT / "slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, module)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    events = []
+
+    def remote_method(name, result=None):
+        def remote(**kwargs):
+            events.append(name)
+            return result
+
+        return types.SimpleNamespace(remote=remote)
+
+    engine = types.SimpleNamespace(
+        pause_generation=remote_method("pause"),
+        flush_cache=remote_method("flush"),
+        begin_weight_update=remote_method("begin", supports_session),
+        end_weight_update=remote_method("end"),
+        continue_generation=remote_method("continue"),
+    )
+    module.ray.get = lambda refs: refs
+    module.dist.barrier = lambda group=None: events.append("barrier")
+    module.post_process_weights = lambda **kwargs: events.append(
+        "legacy_pre" if kwargs["restore_weights_before_load"] else "legacy_post"
+    )
+
+    updater = module.UpdateWeightFromDistributed.__new__(module.UpdateWeightFromDistributed)
+    updater.weight_version = 0
+    updater.rollout_engines = [engine]
+    updater.quantization_config = {"quant_method": "compressed-tensors"}
+    updater._is_pp_src_rank = False
+    updater._send_weights = lambda pbar: events.append("chunks")
+    updater.update_weights()
+
+    assert events == (
+        ["pause", "flush", "begin", "barrier", "chunks", "end", "continue", "barrier"]
+        if supports_session
+        else [
+            "pause", "flush", "begin", "legacy_pre", "barrier", "chunks", "legacy_post", "end", "continue", "barrier"
+        ]
+    )
 
 
 def test_empty_colocated_bucket_still_participates_in_gather(monkeypatch):

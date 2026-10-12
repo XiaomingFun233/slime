@@ -65,6 +65,42 @@ def test_discover_external_engines_reads_server_info(monkeypatch):
     assert info.parallel_config == {"tp_size": 4, "pp_size": 2, "ep_size": 4, "moe_dp_size": 1}
 
 
+@pytest.mark.parametrize("status_code,expected", [(200, True), (404, False), (500, None)])
+def test_weight_update_session_detects_endpoint_capability(monkeypatch, status_code, expected):
+    pytest.importorskip("sglang")
+    import requests
+
+    from slime.backends.sglang_utils.sglang_engine import SGLangEngine
+
+    engine = object.__new__(SGLangEngine)
+    engine.node_rank = 0
+    engine.server_host = "127.0.0.1"
+    engine.server_port = 30000
+    calls = []
+
+    def fake_post(url, json):
+        calls.append((url, json))
+        response = requests.Response()
+        response.status_code = status_code if url.endswith("begin_weight_update") else 200
+        response._content = b'{"success":true,"message":"Success"}'
+        return response
+
+    monkeypatch.setattr("slime.backends.sglang_utils.sglang_engine.requests.post", fake_post)
+
+    if status_code == 500:
+        with pytest.raises(requests.HTTPError):
+            engine.begin_weight_update()
+        assert calls == [("http://127.0.0.1:30000/begin_weight_update", {"selector": "all"})]
+        return
+
+    assert engine.begin_weight_update() is expected
+    engine.end_weight_update()
+    expected_calls = [("http://127.0.0.1:30000/begin_weight_update", {"selector": "all"})]
+    if expected:
+        expected_calls.append(("http://127.0.0.1:30000/end_weight_update", {}))
+    assert calls == expected_calls
+
+
 def test_start_external_rollout_servers_exposes_parallel_configs(monkeypatch):
     class FakeActor:
         init = Namespace(remote=lambda **kwargs: kwargs)

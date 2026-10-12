@@ -55,13 +55,13 @@ def convert_deepseekv4_to_hf(args, name, param):
 
     scale_match = re.fullmatch(
         r"module\.module\.(decoder|mtp)\.layers\.(\d+)\."
-        r"(?:transformer_layer\.)?"
+        r"(?:(transformer_layer|mtp_model_layer)\.)?"
         r"(self_attention_hyper_connection|mlp_hyper_connection)\.(alpha_pre|alpha_post|alpha_res)",
         name,
     )
     if scale_match:
-        block, layer_idx, which, attr = scale_match.groups()
-        if attr != "alpha_pre":
+        block, layer_idx, nested, which, attr = scale_match.groups()
+        if attr != "alpha_res":
             return []
         params = _named_params(args)
         if params is None:
@@ -70,8 +70,8 @@ def convert_deepseekv4_to_hf(args, name, param):
                 "parameters from the same layer"
             )
         layer_prefix = f"module.module.{block}.layers.{layer_idx}."
-        if block == "mtp" and ".transformer_layer." in name:
-            layer_prefix += "transformer_layer."
+        if nested:
+            layer_prefix += f"{nested}."
         prefix = layer_prefix + f"{which}."
         parts = {key: params.get(prefix + key) for key in ("alpha_pre", "alpha_post", "alpha_res")}
         if any(value is None for value in parts.values()):
@@ -85,13 +85,18 @@ def convert_deepseekv4_to_hf(args, name, param):
         raise ValueError(f"Unknown DeepSeek-V4 parameter name: {name}")
     block, layer_idx, rest = layer_match.groups()
     if block == "mtp":
-        rest = rest.removeprefix("transformer_layer.")
+        rest = rest.removeprefix("transformer_layer.").removeprefix("mtp_model_layer.")
         hf_layer = int(layer_idx) + args.num_layers
         mtp_direct = {
             "eh_proj.weight": "eh_proj.weight",
+            "e_proj.weight": "e_proj.weight",
+            "h_proj.weight": "h_proj.weight",
             "enorm.weight": "enorm.weight",
             "hnorm.weight": "hnorm.weight",
             "final_layernorm.weight": "shared_head.norm.weight",
+            "hc_head_fn": "hc_head_fn",
+            "hc_head_base": "hc_head_base",
+            "hc_head_scale": "hc_head_scale",
         }
         if rest in mtp_direct:
             return [(f"model.layers.{hf_layer}.{mtp_direct[rest]}", param)]
@@ -101,8 +106,14 @@ def convert_deepseekv4_to_hf(args, name, param):
 
 
 def _layer_to_hf(args, layer_idx: int, rest: str, param: torch.Tensor):
+    rest = rest.removeprefix("mtp_model_layer.")
     prefix = f"model.layers.{layer_idx}"
     direct = {
+        "hc_head_fn": "hc_head_fn",
+        "hc_head_base": "hc_head_base",
+        "hc_head_scale": "hc_head_scale",
+        "e_proj.weight": "e_proj.weight",
+        "h_proj.weight": "h_proj.weight",
         "input_layernorm.weight": "input_layernorm.weight",
         "pre_mlp_layernorm.weight": "post_attention_layernorm.weight",
         "mlp.linear_fc1.layer_norm_weight": "post_attention_layernorm.weight",
